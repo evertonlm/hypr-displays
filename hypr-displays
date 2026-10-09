@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""hypr-displays: drag-and-drop monitor layout + workspace assignment for Hyprland (Lua config).
+
+Apply  -> changes the live session only (hyprctl eval).
+Save   -> writes a managed block in ~/.config/hypr/monitors.lua and applies it.
+
+The layout logic lives in hypr_displays_core.py (unit tested); this file is the GTK UI and hyprctl glue.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import hypr_displays_core as core  # noqa: E402
+from hypr_displays_core import WORKSPACES  # noqa: E402
+
+VERSION = "0.1.0"
+CONFIG = os.path.expanduser(os.environ.get("HYPR_DISPLAYS_CONFIG", "~/.config/hypr/monitors.lua"))
+SCALES = [1.0, 1.25, 1.333333, 1.5, 1.6, 1.666667, 1.75, 2.0, 2.5, 3.0]
+ROTATIONS = ["0°", "90°", "180°", "270°"]
+SNAP_PX = 14  # snapping distance on the canvas, in screen pixels
+
+
+def hyprctl_json(*args):
+    out = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def lua_eval(code):
+    return subprocess.run(["hyprctl", "eval", code], capture_output=True, text=True)
+
+
+def main():
+    if "--version" in sys.argv:
+        print(f"hypr-displays {VERSION}")
+        return 0
+
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gtk
+
+    class DisplaysWindow(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="Displays")
+            self.set_default_size(1000, 640)
+            self.monitors = []
+            self.ws_map = {}
+            self.selected = None
+            self.drag = None  # (monitor, start_x, start_y, frozen view transform)
+            self.view = None
+            self.updating = False
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            root.set_margin_top(12); root.set_margin_bottom(12); root.set_margin_start(12); root.set_margin_end(12)
+            self.set_child(root)
+
+            main_box = Gtk.Box(spacing=12, vexpand=True)
+            root.append(main_box)
+
+            self.canvas = Gtk.DrawingArea(hexpand=True, vexpand=True)
+            self.canvas.set_draw_func(self.on_draw)
+            drag = Gtk.GestureDrag()
+            drag.connect("drag-begin", self.on_drag_begin)
+            drag.connect("drag-update", self.on_drag_update)
+            drag.connect("drag-end", self.on_drag_end)
+            self.canvas.add_controller(drag)
+            main_box.append(Gtk.Frame(child=self.canvas))
+
+            side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            side.set_size_request(300, -1)
+            scroller = Gtk.ScrolledWindow(child=side, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroller.set_size_request(320, -1)
+            scroller.set_hexpand(False)
+            main_box.append(scroller)
+
+            self.title = Gtk.Label(xalign=0, wrap=True)
+            side.append(self.title)
+
+            grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+            side.append(grid)
+            self.enabled_sw = Gtk.Switch(halign=Gtk.Align.START)
+            self.enabled_sw.connect("notify::active", self.on_enabled)
+            self.mode_dd = Gtk.DropDown.new_from_strings([])
+            self.mode_dd.connect("notify::selected", self.on_mode)
+            self.scale_dd = Gtk.DropDown.new_from_strings([])
+            self.scale_dd.connect("notify::selected", self.on_scale)
+            self.rot_dd = Gtk.DropDown.new_from_strings(ROTATIONS)
+            self.rot_dd.connect("notify::selected", self.on_rotation)
+            for i, (label, w) in enumerate([("Enabled", self.enabled_sw), ("Resolution", self.mode_dd),
+                                            ("Scale", self.scale_dd), ("Rotation", self.rot_dd)]):
+                grid.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
+                w.set_hexpand(True)
+                grid.attach(w, 1, i, 1, 1)
+
+            side.append(Gtk.Separator())
+            side.append(Gtk.Label(label="<b>Workspaces</b>", use_markup=True, xalign=0))
+            self.ws_grid = Gtk.Grid(column_spacing=8, row_spacing=6)
+            side.append(self.ws_grid)
+
+            bar = Gtk.Box(spacing=8)
+            root.append(bar)
+            self.status = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+            bar.append(self.status)
+            for label, cb in [("Reload", self.on_reload), ("Apply", self.on_apply), ("Save", self.on_save)]:
+                b = Gtk.Button(label=label)
+                b.connect("clicked", cb)
+                if label == "Save":
+                    b.add_css_class("suggested-action")
+                bar.append(b)
+
+            self.load()
+
+        # ---------- state ----------
+        def load(self):
+            self.monitors = [core.Monitor(d) for d in hyprctl_json("monitors", "all")]
+            self.monitors.sort(key=lambda m: (m.y, m.x))
+            try:
+                rules = hyprctl_json("workspacerules")
+            except Exception:
+                rules = []
+            self.ws_map = core.initial_ws_map(self.monitors, rules, hyprctl_json("workspaces"))
+            self.selected = next((m for m in self.monitors if m.enabled), self.monitors[0])
+            self.rebuild_ws()
+            self.refresh_side()
+            self.check()
+
+        def enabled(self):
+            return [m for m in self.monitors if m.enabled]
+
+        def check(self):
+            errors, warnings = core.layout_problems(self.monitors)
+            msgs = errors + warnings
+            self.status.set_markup("<span foreground='#e5a50a'>⚠ " + "; ".join(msgs) + "</span>" if msgs
+                                   else "Drag the displays to match your desk. Edges snap together.")
+            self.canvas.queue_draw()
+            return not errors
+
+        # ---------- side panel ----------
+        def refresh_side(self):
+            m = self.selected
+            self.updating = True
+            self.title.set_markup(f"<b>{m.name}</b>\n<small>{m.desc}</small>")
+            self.enabled_sw.set_active(m.enabled)
+            self.mode_dd.set_model(Gtk.StringList.new([core.mode_label(x) for x in m.modes]))
+            self.mode_dd.set_selected(m.modes.index(m.mode) if m.mode in m.modes else 0)
+            self.scales = sorted(set(SCALES) | {round(m.scale, 6)})
+            self.scale_dd.set_model(Gtk.StringList.new([f"{s:g}×" for s in self.scales]))
+            self.scale_dd.set_selected(self.scales.index(round(m.scale, 6)))
+            self.rot_dd.set_selected(m.transform)
+            for w in (self.mode_dd, self.scale_dd, self.rot_dd):
+                w.set_sensitive(m.enabled)
+            self.updating = False
+
+        def rebuild_ws(self):
+            while (child := self.ws_grid.get_first_child()):
+                self.ws_grid.remove(child)
+            names = [m.name for m in self.enabled()]
+            for i, n in enumerate(WORKSPACES):
+                self.ws_grid.attach(Gtk.Label(label=f"Workspace {n}", xalign=0), 0, i, 1, 1)
+                dd = Gtk.DropDown.new_from_strings(names)
+                dd.set_hexpand(True)
+                if self.ws_map.get(n) not in names:
+                    self.ws_map[n] = names[0]
+                dd.set_selected(names.index(self.ws_map[n]))
+                dd.connect("notify::selected", self.on_ws, n, names)
+                self.ws_grid.attach(dd, 1, i, 1, 1)
+
+        def on_ws(self, dd, _p, n, names):
+            self.ws_map[n] = names[dd.get_selected()]
+            self.canvas.queue_draw()
+
+        def on_enabled(self, sw, _p):
+            if self.updating:
+                return
+            m = self.selected
+            if not sw.get_active() and len(self.enabled()) <= 1:
+                self.status.set_text("At least one display must stay enabled.")
+                self.updating = True; sw.set_active(True); self.updating = False
+                return
+            m.enabled = sw.get_active()
+            if m.enabled:
+                others = [o for o in self.enabled() if o is not m]
+                if others:
+                    m.x = max(o.x + o.size()[0] for o in others)
+                    m.y = min(o.y for o in others)
+            core.normalize(self.monitors)
+            self.rebuild_ws()
+            self.refresh_side()
+            self.check()
+
+        def on_mode(self, dd, _p):
+            if self.updating:
+                return
+            self.selected.mode = self.selected.modes[dd.get_selected()]
+            self.check()
+
+        def on_scale(self, dd, _p):
+            if self.updating:
+                return
+            self.selected.scale = self.scales[dd.get_selected()]
+            self.check()
+
+        def on_rotation(self, dd, _p):
+            if self.updating:
+                return
+            self.selected.transform = dd.get_selected()
+            self.check()
+
+        # ---------- canvas ----------
+        def compute_view(self, width, height):
+            mons = self.enabled()
+            x0 = min(m.x for m in mons); y0 = min(m.y for m in mons)
+            x1 = max(m.x + m.size()[0] for m in mons); y1 = max(m.y + m.size()[1] for m in mons)
+            bw, bh = max(x1 - x0, 1), max(y1 - y0, 1)
+            pad = 40
+            f = min((width - 2 * pad) / bw, (height - 2 * pad) / bh) * 0.8
+            return f, (width - bw * f) / 2 - x0 * f, (height - bh * f) / 2 - y0 * f
+
+        def on_draw(self, _area, cr, width, height):
+            self.view = f, ox, oy = self.drag[3] if self.drag else self.compute_view(width, height)
+            accent = Gdk.RGBA()
+            accent.parse("#3584e4")
+            fg = self.get_color()
+            for m in self.enabled():
+                x, y, w, h = m.rect()
+                rx, ry, rw, rh = ox + x * f, oy + y * f, w * f, h * f
+                sel = m is self.selected
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.45 if sel else 0.18)
+                cr.rectangle(rx + 1, ry + 1, rw - 2, rh - 2)
+                cr.fill_preserve()
+                cr.set_source_rgba(accent.red, accent.green, accent.blue, 1 if sel else 0.6)
+                cr.set_line_width(3 if sel else 1.5)
+                cr.stroke()
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 1)
+                ws = ", ".join(str(n) for n in WORKSPACES if self.ws_map.get(n) == m.name) or "—"
+                lines = [(m.name, 16, True), (m.desc, 11, False),
+                         (f"{m.mode[0]}x{m.mode[1]} · {m.scale:g}× · {int(m.x)},{int(m.y)}", 11, False),
+                         (f"Workspaces: {ws}", 12, True)]
+                ty = ry + rh / 2 - sum(s + 6 for _, s, _ in lines) / 2
+                for text, size, bold in lines:
+                    cr.select_font_face("Sans", 0, 1 if bold else 0)
+                    cr.set_font_size(size)
+                    while cr.text_extents(text).width > rw - 12 and len(text) > 4:
+                        text = text[:-2].rstrip() + "…" if not text.endswith("…") else text[:-2] + "…"
+                    ext = cr.text_extents(text)
+                    ty += size + 6
+                    cr.move_to(rx + rw / 2 - ext.width / 2 - ext.x_bearing, ty - 6)
+                    cr.show_text(text)
+
+        def hit(self, px, py):
+            if not self.view:
+                return None
+            f, ox, oy = self.view
+            for m in reversed(self.enabled()):
+                x, y, w, h = m.rect()
+                if ox + x * f <= px <= ox + (x + w) * f and oy + y * f <= py <= oy + (y + h) * f:
+                    return m
+            return None
+
+        def on_drag_begin(self, _g, px, py):
+            m = self.hit(px, py)
+            if not m:
+                return
+            self.selected = m
+            self.refresh_side()
+            self.drag = (m, m.x, m.y, self.view)
+            self.canvas.queue_draw()
+
+        def on_drag_update(self, _g, dx, dy):
+            if not self.drag:
+                return
+            m, sx, sy, (f, _, _) = self.drag
+            m.x, m.y = core.snap(m, sx + dx / f, sy + dy / f, self.monitors, SNAP_PX / f)
+            self.canvas.queue_draw()
+
+        def on_drag_end(self, _g, _dx, _dy):
+            if not self.drag:
+                return
+            self.drag = None
+            core.normalize(self.monitors)
+            self.check()
+
+        # ---------- output ----------
+        def move_workspaces(self):
+            code = core.workspace_moves(hyprctl_json("workspaces"), self.ws_map)
+            if code:
+                lua_eval("\n".join(code))
+
+        def on_apply(self, _b):
+            if not self.check():
+                self.status.set_markup("<span foreground='#e01b24'>Fix the overlap before applying.</span>")
+                return
+            r = lua_eval("\n".join(core.lua_lines(self.monitors, self.ws_map)))
+            self.move_workspaces()
+            self.status.set_text("Applied to this session (not saved)." if r.returncode == 0
+                                 else f"Error: {r.stdout}{r.stderr}")
+
+        def on_save(self, _b):
+            if not self.check():
+                self.status.set_markup("<span foreground='#e01b24'>Fix the overlap before saving.</span>")
+                return
+            text = open(CONFIG).read() if os.path.exists(CONFIG) else ""
+            try:
+                text = core.replace_block(text, core.make_block(core.lua_lines(self.monitors, self.ws_map)))
+            except ValueError as e:
+                self.status.set_markup(f"<span foreground='#e01b24'>{e}</span>")
+                return
+            tmp = CONFIG + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(text)
+            os.replace(tmp, CONFIG)
+            subprocess.run(["hyprctl", "reload"], capture_output=True)
+            errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True).stdout.strip()
+            self.move_workspaces()
+            self.status.set_text(f"Saved, but Hyprland reports: {errors}" if errors
+                                 else f"Saved to {CONFIG} and applied.")
+
+        def on_reload(self, _b):
+            self.load()
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="io.github.evertonlm.HyprDisplays")
+
+        def do_activate(self):
+            win = self.props.active_window or DisplaysWindow(self)
+            win.present()
+
+    return App().run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

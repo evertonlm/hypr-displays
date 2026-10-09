@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Displays
+Comment=Arrange monitors and assign workspaces
+Exec=hypr-displays
+Icon=preferences-desktop-display
+StartupWMClass=io.github.evertonlm.HyprDisplays
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
